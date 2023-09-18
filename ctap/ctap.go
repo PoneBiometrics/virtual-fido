@@ -1,11 +1,15 @@
 package ctap
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io/ioutil"
+	"net"
+	"os"
 
 	"github.com/bulwarkid/virtual-fido/cose"
 	"github.com/bulwarkid/virtual-fido/crypto"
@@ -16,11 +20,15 @@ import (
 	"github.com/fxamacker/cbor/v2"
 )
 
-var ctapLogger = util.NewLogger("[CTAP] ", false)
+var ctapLogger = util.NewLogger("[CTAP] ", true)
 
 var aaguid = [16]byte{117, 108, 90, 245, 236, 166, 1, 163, 47, 198, 211, 12, 226, 242, 1, 197}
 
 type CTAPCommand uint8
+
+type Client struct {
+	conn net.Conn
+}
 
 const (
 	CTAP_COMMAND_MAKE_CREDENTIAL    CTAPCommand = 0x01
@@ -93,13 +101,13 @@ type ctapAuthData struct {
 
 type ctapSelfAttestationStatement struct {
 	Alg cose.COSEAlgorithmID `cbor:"alg"`
-	Sig []byte          `cbor:"sig"`
+	Sig []byte               `cbor:"sig"`
 }
 
 type ctapBasicAttestationStatement struct {
 	Alg cose.COSEAlgorithmID `cbor:"alg"`
-	Sig []byte          `cbor:"sig"`
-	X5c [][]byte        `cbor:"x5c"`
+	Sig []byte               `cbor:"sig"`
+	X5c [][]byte             `cbor:"x5c"`
 }
 
 func ctapMakeAttestedCredentialData(credentialSource *fido_client.CredentialSource) []byte {
@@ -125,8 +133,54 @@ func NewCTAPServer(client fido_client.FIDOClient) *CTAPServer {
 	return &CTAPServer{client: client}
 }
 
+func (client *Client) handleRequest() {
+	reader := bufio.NewReader(client.conn)
+	for {
+		message, err := reader.ReadString('\n')
+		if err != nil {
+			client.conn.Close()
+			return
+		}
+		fmt.Printf("Message incoming: %s", string(message))
+		client.conn.Write([]byte("Message received.\n"))
+	}
+}
+
 func (server *CTAPServer) HandleMessage(data []byte) []byte {
-	command := CTAPCommand(data[0])
+	ctapLogger.Printf("CTAP COMMAND: %#x\n\n", data)
+
+	tcpServer, err := net.ResolveTCPAddr("tcp", "localhost:9002")
+
+	if err != nil {
+		println("ResolveTCPAddr failed:", err.Error())
+		os.Exit(1)
+	}
+
+	conn, err := net.DialTCP("tcp", nil, tcpServer)
+	if err != nil {
+		println("Dial failed:", err.Error())
+		os.Exit(1)
+	}
+
+	_, err = conn.Write(data)
+	if err != nil {
+		println("Write data failed:", err.Error())
+		os.Exit(1)
+	}
+
+	// buffer to get data
+	//received := make([]byte, 1024)
+	//_, err = conn.Read(received)
+	res, err := ioutil.ReadAll(conn)
+	if err != nil {
+		println("Read data failed:", err.Error())
+		os.Exit(1)
+	}
+
+	ctapLogger.Printf("CTAP RESP: %#x\n\n", res)
+	return res
+
+	/*command := CTAPCommand(data[0])
 	ctapLogger.Printf("CTAP COMMAND: %s\n\n", CTAPCommandDescriptions[command])
 	switch command {
 	case CTAP_COMMAND_MAKE_CREDENTIAL:
@@ -139,18 +193,18 @@ func (server *CTAPServer) HandleMessage(data []byte) []byte {
 		return server.handleClientPIN(data[1:])
 	default:
 		panic(fmt.Sprintf("Invalid CTAP Command: %d", command))
-	}
+	}*/
 }
 
 type ctapMakeCredentialArgs struct {
-	ClientDataHash   []byte                          `cbor:"1,keyasint,omitempty"`
+	ClientDataHash   []byte                                   `cbor:"1,keyasint,omitempty"`
 	Rp               webauthn.PublicKeyCredentialRpEntity     `cbor:"2,keyasint,omitempty"`
 	User             webauthn.PublicKeyCrendentialUserEntity  `cbor:"3,keyasint,omitempty"`
 	PubKeyCredParams []webauthn.PublicKeyCredentialParams     `cbor:"4,keyasint,omitempty"`
 	ExcludeList      []webauthn.PublicKeyCredentialDescriptor `cbor:"5,keyasint,omitempty"`
-	Options          *CTAPCommandOptions             `cbor:"7,keyasint,omitempty"`
-	PinAuth          []byte                          `cbor:"8,keyasint,omitempty"`
-	PinProtocol      uint32                          `cbor:"9,keyasint,omitempty"`
+	Options          *CTAPCommandOptions                      `cbor:"7,keyasint,omitempty"`
+	PinAuth          []byte                                   `cbor:"8,keyasint,omitempty"`
+	PinProtocol      uint32                                   `cbor:"9,keyasint,omitempty"`
 }
 
 func (args ctapMakeCredentialArgs) String() string {
@@ -225,11 +279,11 @@ func (server *CTAPServer) handleMakeCredential(data []byte) []byte {
 }
 
 type ctapGetInfoOptions struct {
-	IsPlatform      bool `cbor:"plat"`
-	CanResidentKey  bool `cbor:"rk"`
-	HasClientPIN    bool `cbor:"clientPin"`
-	CanUserPresence bool `cbor:"up"`
-	// CanUserVerification bool `cbor:"uv"`
+	IsPlatform          bool `cbor:"plat"`
+	CanResidentKey      bool `cbor:"rk"`
+	HasClientPIN        bool `cbor:"clientPin"`
+	CanUserPresence     bool `cbor:"up"`
+	CanUserVerification bool `cbor:"uv"`
 }
 
 type ctapGetInfoResponse struct {
@@ -246,11 +300,11 @@ func (server *CTAPServer) handleGetInfo(data []byte) []byte {
 		Versions: []string{"FIDO_2_0", "U2F_V2"},
 		AAGUID:   aaguid,
 		Options: ctapGetInfoOptions{
-			IsPlatform:      false,
-			CanResidentKey:  true,
-			CanUserPresence: true,
-			HasClientPIN:    server.client.PINHash() != nil,
-			// CanUserVerification: true,
+			IsPlatform:          false,
+			CanResidentKey:      true,
+			CanUserPresence:     true,
+			HasClientPIN:        false, //server.client.PINHash() != nil,
+			CanUserVerification: true,
 		},
 		PinProtocols: []uint32{1},
 	}
@@ -259,12 +313,12 @@ func (server *CTAPServer) handleGetInfo(data []byte) []byte {
 }
 
 type ctapGetAssertionArgs struct {
-	RpID           string                          `cbor:"1,keyasint"`
-	ClientDataHash []byte                          `cbor:"2,keyasint"`
+	RpID           string                                   `cbor:"1,keyasint"`
+	ClientDataHash []byte                                   `cbor:"2,keyasint"`
 	AllowList      []webauthn.PublicKeyCredentialDescriptor `cbor:"3,keyasint"`
-	Options        CTAPCommandOptions              `cbor:"5,keyasint"`
-	PinAuth        []byte                          `cbor:"6,keyasint,omitempty"`
-	PinProtocol    uint32                          `cbor:"7,keyasint,omitempty"`
+	Options        CTAPCommandOptions                       `cbor:"5,keyasint"`
+	PinAuth        []byte                                   `cbor:"6,keyasint,omitempty"`
+	PinProtocol    uint32                                   `cbor:"7,keyasint,omitempty"`
 }
 
 type ctapGetAssertionResponse struct {
@@ -347,7 +401,7 @@ var ctapClientPINSubcommandDescriptions = map[ctapClientPINSubcommand]string{
 type ctapClientPINArgs struct {
 	PinProtocol     uint32                  `cbor:"1,keyasint"`
 	SubCommand      ctapClientPINSubcommand `cbor:"2,keyasint"`
-	KeyAgreement    *cose.COSEPublicKey      `cbor:"3,keyasint,omitempty"`
+	KeyAgreement    *cose.COSEPublicKey     `cbor:"3,keyasint,omitempty"`
 	PINAuth         []byte                  `cbor:"4,keyasint,omitempty"`
 	NewPINEncoding  []byte                  `cbor:"5,keyasint,omitempty"`
 	PINHashEncoding []byte                  `cbor:"6,keyasint,omitempty"`
@@ -365,8 +419,8 @@ func (args ctapClientPINArgs) String() string {
 
 type ctapClientPINResponse struct {
 	KeyAgreement *cose.COSEPublicKey `cbor:"1,keyasint,omitempty"`
-	PinToken     []byte             `cbor:"2,keyasint,omitempty"`
-	Retries      *uint8             `cbor:"3,keyasint,omitempty"`
+	PinToken     []byte              `cbor:"2,keyasint,omitempty"`
+	Retries      *uint8              `cbor:"3,keyasint,omitempty"`
 }
 
 func (args ctapClientPINResponse) String() string {
@@ -527,6 +581,6 @@ func (server *CTAPServer) handleGetPINToken(args ctapClientPINArgs) []byte {
 	response := ctapClientPINResponse{
 		PinToken: crypto.EncryptAESCBC(sharedSecret, server.client.PINToken()),
 	}
-	ctapLogger.Printf("GET_PIN_TOKEN RESPONSE: %#v\n\n",response)
+	ctapLogger.Printf("GET_PIN_TOKEN RESPONSE: %#v\n\n", response)
 	return append([]byte{byte(CTAP1_ERR_SUCCESS)}, util.MarshalCBOR(response)...)
 }

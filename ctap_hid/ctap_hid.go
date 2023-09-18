@@ -1,8 +1,12 @@
 package ctap_hid
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
+	"io/ioutil"
+	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -11,7 +15,7 @@ import (
 	"github.com/bulwarkid/virtual-fido/util"
 )
 
-var ctapHIDLogger = util.NewLogger("[CTAPHID] ", false)
+var ctapHIDLogger = util.NewLogger("[CTAPHID] ", true)
 
 const CTAPHID_STATUS_UPNEEDED uint8 = 2
 
@@ -22,6 +26,10 @@ const (
 )
 
 type CTAPHIDCommand uint8
+
+type Client struct {
+	conn net.Conn
+}
 
 const (
 	// Each CTAPHID command has its seventh bit set for easier reading
@@ -200,8 +208,56 @@ func (server *CTAPHIDServer) sendResponse(response [][]byte) {
 	server.responsesLock.Unlock()
 }
 
+func (client *Client) handleRequest() {
+	reader := bufio.NewReader(client.conn)
+	for {
+		message, err := reader.ReadString('\n')
+		if err != nil {
+			client.conn.Close()
+			return
+		}
+		fmt.Printf("Message incoming: %s", string(message))
+		client.conn.Write([]byte("Message received.\n"))
+	}
+}
+
 func (server *CTAPHIDServer) HandleMessage(message []byte) {
-	buffer := bytes.NewBuffer(message)
+	ctapHIDLogger.Printf("HIDCTAP COMMAND: %#x\n\n", message)
+
+	tcpServer, err := net.ResolveTCPAddr("tcp", "localhost:8001")
+
+	if err != nil {
+		println("ResolveTCPAddr failed:", err.Error())
+		os.Exit(1)
+	}
+
+	conn, err := net.DialTCP("tcp", nil, tcpServer)
+	if err != nil {
+		println("Dial failed:", err.Error())
+		os.Exit(1)
+	}
+
+	_, err = conn.Write(message)
+	if err != nil {
+		println("Write data failed:", err.Error())
+		os.Exit(1)
+	}
+
+	// buffer to get data
+	//received := make([]byte, 1024)
+	//_, err = conn.Read(received)
+	res, err := ioutil.ReadAll(conn)
+	if err != nil {
+		println("Read data failed:", err.Error())
+		os.Exit(1)
+	}
+
+	ctapHIDLogger.Printf("HIDCTAP RESP: %#x\n\n", res)
+	var data = make([][]byte, 1)
+	data[0] = res
+	server.sendResponse(data)
+
+	/*buffer := bytes.NewBuffer(message)
 	channelId := util.ReadLE[CTAPHIDChannelID](buffer)
 	channel, exists := server.channels[channelId]
 	if !exists {
@@ -211,7 +267,7 @@ func (server *CTAPHIDServer) HandleMessage(message []byte) {
 	}
 	channel.messageLock.Lock()
 	channel.handleIntermediateMessage(server, message)
-	channel.messageLock.Unlock()
+	channel.messageLock.Unlock()*/
 }
 
 type CTAPHIDChannel struct {
@@ -308,7 +364,7 @@ func (channel *CTAPHIDChannel) handleIntermediateMessage(server *CTAPHIDServer, 
 
 func (channel *CTAPHIDChannel) handleFinalizedMessage(server *CTAPHIDServer, header CTAPHIDMessageHeader, payload []byte) {
 	// TODO: Handle cancel message
-	ctapHIDLogger.Printf("CTAPHID FINALIZED MESSAGE: %s %#v\n\n", header, payload)
+	ctapHIDLogger.Printf("CTAPHID FINALIZED MESSAGE: %s %#x\n\n", header, payload)
 	var response [][]byte = nil
 	if channel.channelId == CTAPHID_BROADCAST_CHANNEL {
 		response = channel.handleBroadcastMessage(server, header, payload)
@@ -335,12 +391,12 @@ func (channel *CTAPHIDChannel) handleBroadcastMessage(server *CTAPHIDServer, hea
 		copy(response.Nonce[:], nonce)
 		server.maxChannelID += 1
 		server.channels[response.NewChannelID] = newCTAPHIDChannel(response.NewChannelID)
-		ctapHIDLogger.Printf("CTAPHID INIT RESPONSE: %#v\n\n", response)
+		ctapHIDLogger.Printf("CTAPHID INIT RESPONSE: %#x\n\n", response)
 		return createResponsePackets(CTAPHID_BROADCAST_CHANNEL, CTAPHID_COMMAND_INIT, util.ToLE(response))
 	case CTAPHID_COMMAND_PING:
 		return createResponsePackets(CTAPHID_BROADCAST_CHANNEL, CTAPHID_COMMAND_PING, payload)
 	default:
-		panic(fmt.Sprintf("Invalid CTAPHID Broadcast command: %#v", header))
+		panic(fmt.Sprintf("Invalid CTAPHID Broadcast command: %x", header))
 	}
 }
 
@@ -348,13 +404,14 @@ func (channel *CTAPHIDChannel) handleDataMessage(server *CTAPHIDServer, header C
 	switch header.Command {
 	case CTAPHID_COMMAND_MSG:
 		responsePayload := server.u2fServer.HandleU2FMessage(payload)
-		ctapHIDLogger.Printf("CTAPHID MSG RESPONSE: %d %#v\n\n", len(responsePayload), responsePayload)
+		ctapHIDLogger.Printf("CTAPHID MSG RESPONSE: %d %#x\n\n", len(responsePayload), responsePayload)
 		return createResponsePackets(header.ChannelID, CTAPHID_COMMAND_MSG, responsePayload)
 	case CTAPHID_COMMAND_CBOR:
 		stop := util.StartRecurringFunction(keepConnectionAlive(server, channel.channelId, CTAPHID_STATUS_UPNEEDED), 100)
+		ctapHIDLogger.Printf("ERIK: %#x\n\n", payload)
 		responsePayload := server.ctapServer.HandleMessage(payload)
 		stop <- 0
-		ctapHIDLogger.Printf("CTAPHID CBOR RESPONSE: %#v\n\n", responsePayload)
+		ctapHIDLogger.Printf("CTAPHID CBOR RESPONSE: %#x\n\n", responsePayload)
 		return createResponsePackets(header.ChannelID, CTAPHID_COMMAND_CBOR, responsePayload)
 	case CTAPHID_COMMAND_PING:
 		return createResponsePackets(header.ChannelID, CTAPHID_COMMAND_PING, payload)
