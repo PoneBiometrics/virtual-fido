@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"sync"
@@ -246,16 +245,46 @@ func (server *CTAPHIDServer) HandleMessage(message []byte) {
 	// buffer to get data
 	//received := make([]byte, 1024)
 	//_, err = conn.Read(received)
-	res, err := ioutil.ReadAll(conn)
-	if err != nil {
-		println("Read data failed:", err.Error())
-		os.Exit(1)
-	}
 
-	ctapHIDLogger.Printf("HIDCTAP RESP: %#x\n\n", res)
-	var data = make([][]byte, 1)
-	data[0] = res
-	server.sendResponse(data)
+	var running = true
+	var packageCounter uint16 = 0
+
+	for running {
+		packageData := make([]byte, 64)
+		res, err := conn.Read(packageData)
+		println("Read length:", res)
+		if err != nil {
+			println("Read data failed:", err.Error())
+			os.Exit(1)
+		}
+
+		ctapHIDLogger.Printf("HIDCTAP RESP: %#x\n\n", packageData)
+
+		// Keep-alive
+		if packageData[4] == 0xBB {
+			continue
+		} else if packageData[4]&0x80 == 0x80 {
+			// First package in seq
+			var highSize uint16 = uint16(packageData[5]) << 8
+			var lowSize uint16 = uint16(packageData[6])
+			var packageSize = highSize + lowSize
+
+			packageCounter = ((packageSize + 60) / 59) - 1
+			println("Package counter", packageCounter, packageSize)
+		} else {
+			packageCounter--
+		}
+
+		if packageCounter == 0 {
+			running = false
+		}
+
+		var data = make([][]byte, 1)
+		data[0] = packageData
+		server.sendResponse(data)
+	}
+	println("Package seq is done")
+	conn.Close()
 
 	/*buffer := bytes.NewBuffer(message)
 	channelId := util.ReadLE[CTAPHIDChannelID](buffer)
