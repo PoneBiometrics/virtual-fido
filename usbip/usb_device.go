@@ -3,14 +3,19 @@ package usbip
 import (
 	"bytes"
 	"fmt"
+	"log"
+	"net"
+	"os"
 	"sync"
+	"time"
 	"unsafe"
 
-	"github.com/bulwarkid/virtual-fido/ctap_hid"
 	"github.com/bulwarkid/virtual-fido/util"
 )
 
-var usbLogger = util.NewLogger("[USB] ", false)
+var usbLogger = util.NewLogger("[USB] ", true)
+var outputBuffer = make([]byte, 64)
+var hasOutputBuffer = false
 
 type USBDevice interface {
 	handleMessage(id uint32, onFinish func(), endpoint uint32, setup USBSetupPacket, transferBuffer []byte)
@@ -20,16 +25,18 @@ type USBDevice interface {
 }
 
 type USBDeviceImpl struct {
-	Index         int
-	ctapHIDServer *ctap_hid.CTAPHIDServer
-	outputLock    sync.Locker
+	Index             int
+	outputLock        sync.Locker
+	simulatorSendLock sync.Locker
 }
 
-func NewUSBDevice(ctapHIDServer *ctap_hid.CTAPHIDServer) *USBDeviceImpl {
+func NewUSBDevice() *USBDeviceImpl {
+	go startServer()
+
 	return &USBDeviceImpl{
-		Index:         0,
-		ctapHIDServer: ctapHIDServer,
-		outputLock:    &sync.Mutex{},
+		Index:             0,
+		outputLock:        &sync.Mutex{},
+		simulatorSendLock: &sync.Mutex{},
 	}
 }
 
@@ -125,7 +132,7 @@ func (device *USBDeviceImpl) getEndpointDescriptors() []USBEndpointDescriptor {
 func (device *USBDeviceImpl) getStringDescriptor(index uint8) []byte {
 	switch index {
 	case 1:
-		return util.Utf16encode("No Company")
+		return util.Utf16encode("No company")
 	case 2:
 		return util.Utf16encode("Virtual FIDO")
 	case 3:
@@ -279,24 +286,151 @@ func (device *USBDeviceImpl) handleControlMessage(setup USBSetupPacket, transfer
 	}
 }
 
+/****************************************************************/
+// Client that handle incoming USB messages.
+func sendPackageToSimulator(packageData []byte, lock sync.Locker) {
+
+	lock.Lock()
+	var buffer = make([]byte, 64)
+	copy(buffer, packageData)
+
+	tcpServer, err := net.ResolveTCPAddr("tcp", "localhost:8001")
+
+	if err != nil {
+		println("ResolveTCPAddr failed:", err.Error())
+		os.Exit(1)
+	}
+
+	conn, err := net.DialTCP("tcp", nil, tcpServer)
+	if err != nil {
+		println("Dial failed:", err.Error())
+		os.Exit(1)
+	}
+
+	_, err = conn.Write(buffer)
+	if err != nil {
+		println("Write data failed:", err.Error())
+		os.Exit(1)
+	}
+
+	conn.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	lock.Unlock()
+}
+
+/****************************************************************/
+// Server stuff
+type Server struct {
+	host string
+	port string
+}
+
+// Client ...
+type Client struct {
+	conn net.Conn
+}
+
+// Config ...
+type Config struct {
+	Host string
+	Port string
+}
+
+// New ...
+func New(config *Config) *Server {
+	return &Server{
+		host: config.Host,
+		port: config.Port,
+	}
+}
+
+// Run ...
+func (server *Server) Run() {
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%s", server.host, server.port))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer listener.Close()
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		println("New connection")
+		client := &Client{
+			conn: conn,
+		}
+		go client.handleRequest()
+	}
+}
+
+func (client *Client) handleRequest() {
+	packageData := make([]byte, 64)
+
+	res, err := client.conn.Read(packageData)
+	println("Res length:", res)
+	if err != nil {
+		println("Read failed", err.Error())
+		os.Exit(1)
+	}
+
+	copy(outputBuffer, packageData)
+	hasOutputBuffer = true
+
+	client.conn.Close()
+}
+
+func startServer() {
+	server := New(&Config{
+		Host: "localhost",
+		Port: "8002",
+	})
+	server.Run()
+}
+
+/****************************************************************/
+
 func (device *USBDeviceImpl) handleInputMessage(setup USBSetupPacket, transferBuffer []byte) {
-	usbLogger.Printf("INPUT TRANSFER BUFFER: %#v\n\n", transferBuffer)
-	go device.ctapHIDServer.HandleMessage(transferBuffer)
+	usbLogger.Printf("INPUT TRANSFER BUFFER: %#v\n", transferBuffer)
+	go sendPackageToSimulator(transferBuffer, device.simulatorSendLock)
 }
 
 func (device *USBDeviceImpl) handleOutputMessage(id uint32, setup USBSetupPacket, transferBuffer []byte, onFinish func()) {
 	// Only process one output message at a time in order to maintain message order
+	println("aadsfasdf")
 	device.outputLock.Lock()
-	response := device.ctapHIDServer.GetResponse(id, 1000)
+	/*response := device.ctapHIDServer.GetResponse(id, 1000)
 	if response != nil {
 		copy(transferBuffer, response)
+		onFinish()
+	}*/
+
+	for i := 0; i < 10; i++ {
+		if hasOutputBuffer {
+			break
+		} else {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	println("Has data to send", hasOutputBuffer)
+	if hasOutputBuffer {
+		usbLogger.Printf("OUTPUT TRANSFER BUFFER: %#v\n", outputBuffer)
+		hasOutputBuffer = false
+		copy(transferBuffer, outputBuffer)
 		onFinish()
 	}
 	device.outputLock.Unlock()
 }
 
 func (device *USBDeviceImpl) removeWaitingRequest(id uint32) bool {
-	return device.ctapHIDServer.RemoveWaitingRequest(id)
+	// TODO: Erik: What to do here?
+	println("removeWaitingRequest called")
+	return true
+	//return device.ctapHIDServer.RemoveWaitingRequest(id)
 }
 
 func (device *USBDeviceImpl) handleMessage(id uint32, onFinish func(), endpoint uint32, setup USBSetupPacket, transferBuffer []byte) {
